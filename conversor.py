@@ -3,11 +3,9 @@ import uuid
 from datetime import datetime
 from dateutil import parser as dateparser
 
-import chardet
 import pandas as pd
 import streamlit as st
 
-# ---------------------- Setup da página ----------------------
 st.set_page_config(
     page_title="Excel/CSV → OFX Converter",
     page_icon="💳",
@@ -16,44 +14,27 @@ st.set_page_config(
 st.title("💳 Excel/CSV → OFX Converter")
 st.caption("Converta planilhas (CSV/XLSX/XLS/XLSB) para OFX 1.03/SGML.")
 
-# ---------------------- Helpers de leitura ----------------------
-def sniff_encoding(file_bytes: bytes, default="utf-8"):
-    try:
-        res = chardet.detect(file_bytes)
-        enc = res.get("encoding") or default
-        return enc
-    except Exception:
-        return default
-
 def load_dataframe(uploaded):
-    """Carrega CSV/XLSX/XLS/XLSB de maneira robusta."""
     if uploaded is None:
         return None
 
     name = uploaded.name.lower()
-
-    # Precisamos do conteúdo em bytes para reabrir várias vezes
     raw = uploaded.read()
     bio = io.BytesIO(raw)
 
     if name.endswith(".csv"):
-        # 1) tenta utf-8 padrão
         try:
             bio.seek(0)
             return pd.read_csv(bio)
         except UnicodeDecodeError:
-            # 2) tenta detectar encoding
-            enc = sniff_encoding(raw, default="latin-1")
-            # tenta separadores comuns
             for sep in [",", ";", "\t", "|"]:
                 try:
                     bio.seek(0)
-                    return pd.read_csv(bio, encoding=enc, sep=sep)
+                    return pd.read_csv(bio, encoding="latin-1", sep=sep)
                 except Exception:
                     continue
-            # último recurso
             bio.seek(0)
-            return pd.read_csv(bio, encoding=enc, engine="python", sep=None)
+            return pd.read_csv(bio, encoding="latin-1", engine="python", sep=None)
     elif name.endswith(".xlsx"):
         bio.seek(0)
         return pd.read_excel(bio, engine="openpyxl")
@@ -66,36 +47,24 @@ def load_dataframe(uploaded):
     else:
         raise ValueError("Formato não suportado. Envie CSV, XLSX, XLS ou XLSB.")
 
-# ---------------------- Normalizações ----------------------
 def norm_date(x, fmt_hint: str):
     if pd.isna(x):
         return None
     try:
         if fmt_hint.strip():
             return datetime.strptime(str(x), fmt_hint)
-        # dayfirst=True ajuda em dd/mm/yyyy
         return dateparser.parse(str(x), dayfirst=True)
     except Exception:
         return None
 
 def norm_amount(x):
-    """Normaliza valores como: 'R$ 1.234,56' → 1234.56  | '1,234.56' → 1234.56"""
     if pd.isna(x):
         return None
-    s = str(x).strip()
-    # remove R$ e espaços
-    s = s.replace("R$", "").replace(" ", "")
-    # heurística: se tiver vírgula e NÃO tiver ponto como decimal, trocar vírgula por ponto
-    # também remove separadores de milhar
+    s = str(x).strip().replace("R$", "").replace(" ", "")
     if s.count(",") == 1 and s.count(".") == 0:
-        s = s.replace(".", "")      # remove eventuais milhares antigos
-        s = s.replace(",", ".")     # vírgula decimal → ponto
-    else:
-        # tentar remover milhares (pontos) quando vier em estilo brasileiro
-        # '1.234,56' -> '1234,56' -> depois vira 1234.56 no try abaixo
-        if "," in s and "." in s and s.rfind(",") > s.rfind("."):
-            s = s.replace(".", "")
-            s = s.replace(",", ".")
+        s = s.replace(".", "").replace(",", ".")
+    elif "," in s and "." in s and s.rfind(",") > s.rfind("."):
+        s = s.replace(".", "").replace(",", ".")
     try:
         return float(s)
     except Exception:
@@ -104,16 +73,9 @@ def norm_amount(x):
         except Exception:
             return None
 
-def infer_trntype(v):
-    if v is None:
-        return "DEBIT"
-    return "CREDIT" if v >= 0 else "DEBIT"
-
 def fmt_dtposted(dt: datetime):
-    # OFX 1.03 costuma aceitar YYYYMMDD ou YYYYMMDDHHMMSS (vamos num simples)
     return dt.strftime("%Y%m%d")
 
-# ---------------------- OFX Builders ----------------------
 def ofx_header():
     return (
         "OFXHEADER:100\n"
@@ -161,7 +123,6 @@ def ofx_close():
         "</OFX>\n"
     )
 
-# ---------------------- UI ----------------------
 st.markdown("### 1) Envie seu arquivo")
 file = st.file_uploader("Excel (.xlsx, .xls, .xlsb) ou CSV (.csv)", type=["xlsx", "xls", "xlsb", "csv"])
 
@@ -182,7 +143,6 @@ df = None
 error_box = st.empty()
 try:
     if file is not None:
-        # volta o ponteiro para o início, pois o st.file_uploader moveu
         file.seek(0)
         df = load_dataframe(file)
 except Exception as e:
@@ -194,7 +154,7 @@ if df is not None:
 
     cols = ["<nenhuma>"] + list(df.columns)
     date_col   = st.selectbox("Coluna de DATA", cols)
-    amount_col = st.selectbox("Coluna de VALOR (positivo/crédito, negativo/débito)", cols)
+    amount_col = st.selectbox("Coluna de VALOR", cols)
     memo_col   = st.selectbox("Coluna de DESCRIÇÃO/MEMO", cols)
     fitid_col  = st.selectbox("Coluna de ID (FITID) [opcional]", cols, index=0)
     ttype_col  = st.selectbox("Coluna de TIPO (CREDIT/DEBIT) [opcional]", cols, index=0)
@@ -211,9 +171,8 @@ if df is not None:
     if not ready:
         st.warning("Selecione as colunas obrigatórias: " + ", ".join(missing))
     else:
-        # ---------------------- Monta transações ----------------------
         transactions = []
-        skipped = []  # para logar linhas ignoradas
+        skipped = []
 
         for idx, row in df.iterrows():
             dt = norm_date(row[date_col], date_hint) if date_col in df.columns else None
@@ -236,20 +195,15 @@ if df is not None:
             else:
                 ttype = "CREDIT" if amt >= 0 else "DEBIT"
 
-            if fitid_col != "<nenhuma>":
-                fitid = str(row[fitid_col])
-            else:
-                fitid = uuid.uuid4().hex if fitid_auto else f"{int(dt.timestamp())}-{abs(hash((amt, memo)))%10_000_000}"
+            fitid = str(row[fitid_col]) if fitid_col != "<nenhuma>" else uuid.uuid4().hex if fitid_auto else f"{int(dt.timestamp())}-{abs(hash((amt, memo)))%10_000_000}"
 
-            transactions.append(
-                {
-                    "DTPOSTED": fmt_dtposted(dt),
-                    "TRNAMT": f"{amt:.2f}",
-                    "TRNTYPE": ttype,
-                    "FITID": fitid,
-                    "MEMO": memo,
-                }
-            )
+            transactions.append({
+                "DTPOSTED": fmt_dtposted(dt),
+                "TRNAMT": f"{amt:.2f}",
+                "TRNTYPE": ttype,
+                "FITID": fitid,
+                "MEMO": memo,
+            })
 
         if len(transactions) == 0:
             st.error("Nenhuma transação válida encontrada com o mapeamento atual.")
@@ -276,13 +230,10 @@ if df is not None:
             st.success(f"Gerado {len(transactions)} lançamento(s).")
             fname = f"export_{acct_id}_{dtstart}_{dtend}.ofx"
             st.download_button("⬇️ Baixar OFX", data=ofx_text.encode("utf-8"), file_name=fname, mime="application/x-ofx")
-
             with st.expander("📄 Visualizar OFX"):
                 st.code(ofx_text, language="xml")
-
             if skipped:
                 st.warning(f"{len(skipped)} linha(s) foram ignoradas.")
                 st.dataframe(pd.DataFrame(skipped), use_container_width=True)
 else:
     st.info("Envie um arquivo Excel (.xlsx/.xls/.xlsb) ou CSV para começar.")
-
